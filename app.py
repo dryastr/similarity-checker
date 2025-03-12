@@ -1,11 +1,17 @@
 
 from gensim.models.doc2vec import Doc2Vec
-from flask import Flask, render_template, request, redirect, session, flash, url_for
+from flask import Flask, render_template, request, redirect, session, flash, url_for, send_file
 import os
 import re
 import psycopg2
 import pdfplumber
 import spacy
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_JUSTIFY, TA_LEFT, TA_CENTER
 from docx import Document
 from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
 from Sastrawi.StopWordRemover.StopWordRemoverFactory import StopWordRemoverFactory
@@ -204,6 +210,110 @@ INDONESIAN_STOPWORDS = set([
 ])
 
 
+def mark_similar_words_in_original(original_text, similar_tokens):
+    """
+    Mencari dan menandai kata-kata dalam teks asli berdasarkan token yang similar
+
+    Args:
+        original_text (str): Teks asli dari dokumen
+        similar_tokens (set): Kumpulan token yang dianggap similar
+
+    Returns:
+        list: Tuple berisi (kata, is_similar)
+    """
+    factory = StemmerFactory()
+    stemmer = factory.create_stemmer()
+
+    # Split teks asli dengan mempertahankan spasi dan tanda baca
+    words = re.findall(r'\b\w+\b|\s+|[^\w\s]', original_text)
+
+    marked_words = []
+    for word in words:
+        # Jika kata (bukan spasi atau tanda baca)
+        if re.match(r'\b\w+\b', word):
+            # Stem kata untuk pengecekan
+            word_stem = stemmer.stem(word.lower())
+            if word_stem in similar_tokens:
+                marked_words.append((word, True))  # Word is similar
+            else:
+                marked_words.append((word, False))  # Word is not similar
+        else:
+            # Spasi atau tanda baca tetap dipertahankan
+            marked_words.append((word, False))
+
+    return marked_words
+
+# Function untuk menghasilkan PDF dengan highlight
+
+
+def create_highlighted_pdf(original_text, similar_tokens, output_path):
+    """
+    Membuat PDF baru dengan highlight pada kata-kata yang similar
+
+    Args:
+        original_text (str): Teks asli dari dokumen
+        similar_tokens (set): Kumpulan token yang dianggap similar
+        output_path (str): Path untuk menyimpan PDF hasil
+
+    Returns:
+        str: Path ke file PDF yang dihasilkan
+    """
+    marked_words = mark_similar_words_in_original(
+        original_text, similar_tokens)
+
+    # Buat PDF dengan reportlab
+    doc = SimpleDocTemplate(
+        output_path,
+        pagesize=letter,
+        rightMargin=72, leftMargin=72,
+        topMargin=72, bottomMargin=72
+    )
+
+    styles = getSampleStyleSheet()
+    normal_style = styles["Normal"]
+
+    # Define style untuk kata yang similar
+    similar_style = ParagraphStyle(
+        "Similar",
+        parent=normal_style,
+        backColor=colors.yellow,
+    )
+
+    # Gabungkan kata-kata menjadi paragraf dengan highlight
+    content = []
+    current_paragraph = ""
+
+    for word, is_similar in marked_words:
+        if is_similar:
+            # Escape karakter khusus di HTML
+            escaped_word = word.replace("&", "&amp;").replace(
+                "<", "&lt;").replace(">", "&gt;")
+            current_paragraph += f'<span backColor="yellow">{escaped_word}</span>'
+        else:
+            # Jika karakter spesial, langsung tambahkan
+            current_paragraph += word
+
+        # Jika newline, buat paragraf baru
+        if word == '\n' or word == '\r\n':
+            if current_paragraph:
+                p = Paragraph(current_paragraph, normal_style)
+                content.append(p)
+                content.append(Spacer(1, 12))
+                current_paragraph = ""
+
+    # Tambahkan paragraf terakhir jika ada
+    if current_paragraph:
+        p = Paragraph(current_paragraph, normal_style)
+        content.append(p)
+
+    # Build PDF
+    doc.build(content)
+
+    return output_path
+
+# Modifikasi function preprocess_text dan calculate_similarity untuk menyimpan token similar
+
+
 def preprocess_text(text):
     factory = StemmerFactory()
     stemmer = factory.create_stemmer()
@@ -213,22 +323,6 @@ def preprocess_text(text):
     tokens = [word for word in tokens if word not in INDONESIAN_STOPWORDS]
     stemmed_tokens = [stemmer.stem(word) for word in tokens]
     return stemmed_tokens
-
-
-def highlight_similar_parts(text1, text2):
-    tokens1 = set(preprocess_text(text1))
-    tokens2 = preprocess_text(text2)
-
-    highlighted = []
-    mark_count = 0
-    for token in tokens2:
-        if token in tokens1:
-            highlighted.append(f"<mark>{token}</mark>")
-            mark_count += 1
-        else:
-            highlighted.append(token)
-
-    return " ".join(highlighted), mark_count
 
 
 def calculate_similarity(user_doc, db_docs):
@@ -242,9 +336,14 @@ def calculate_similarity(user_doc, db_docs):
         similarity = model.docvecs.cosine_similarities(
             user_vector, [db_vector])[0]
         similarity = float(similarity)
-        matched_text, mark_count = highlight_similar_parts(
-            user_doc, db_doc['file_text'])
-        db_tokens = preprocess_text(db_doc['file_text'])
+
+        # Dapatkan token yang similar
+        db_tokens = set(preprocess_text(db_doc['file_text']))
+        user_tokens_set = set(user_tokens)
+        similar_tokens = db_tokens.intersection(user_tokens_set)
+
+        # Hitung jumlah token yang similar
+        mark_count = len(similar_tokens)
         db_token_count = len(db_tokens)
 
         if db_token_count > 0:
@@ -254,9 +353,75 @@ def calculate_similarity(user_doc, db_docs):
 
         normalized_score = min(normalized_score, 100)
 
-        similarities.append((db_doc['id'], normalized_score, matched_text))
+        # Simpan set token yang similar
+        similarities.append((db_doc['id'], normalized_score, similar_tokens))
 
     return sorted(similarities, key=lambda x: x[1], reverse=True)[:5]
+
+# Tambahkan function untuk menyimpan file hasil ke sistem
+
+
+def save_result_pdf(user_id, file_name, original_text, similar_tokens, doc_id):
+    """
+    Menyimpan hasil analisis sebagai PDF dengan highlight berdasarkan ID history.
+
+    Args:
+        user_id (int): ID user
+        file_name (str): Nama file asli
+        original_text (str): Teks asli dari dokumen
+        similar_tokens (set): Kumpulan token yang dianggap similar
+        doc_id (int): ID dokumen pembanding
+
+    Returns:
+        str: Path ke file PDF hasil
+    """
+    # Koneksi ke database
+    conn = psycopg2.connect(
+        "dbname=db_similarity user=postgres password=guitarflash215 host=localhost"
+    )
+    cur = conn.cursor()
+
+    # Ambil ID terbaru dari history yang sesuai
+    cur.execute(
+        """
+        SELECT id FROM history 
+        WHERE user_id = %s AND document_id = %s AND uploaded_file_name = %s 
+        ORDER BY id DESC LIMIT 1
+        """,
+        (user_id, doc_id, file_name)
+    )
+    history_entry = cur.fetchone()
+
+    if not history_entry:
+        cur.close()
+        conn.close()
+        raise ValueError("History entry tidak ditemukan.")
+
+    history_id = history_entry[0]  # Ambil ID history yang baru saja dibuat
+
+    # Buat direktori jika belum ada
+    result_dir = os.path.join(
+        app.config['UPLOAD_FOLDER'], 'results', str(user_id))
+    os.makedirs(result_dir, exist_ok=True)
+
+    # Buat nama file PDF menggunakan ID history agar unik
+    base_name = os.path.splitext(file_name)[0]
+    result_file = os.path.join(result_dir, f"{base_name}_doc{history_id}.pdf")
+
+    # Buat PDF dengan highlight
+    create_highlighted_pdf(original_text, similar_tokens, result_file)
+
+    # Perbarui history dengan path file hasil
+    cur.execute(
+        "UPDATE history SET result_file_path = %s WHERE id = %s",
+        (result_file, history_id)
+    )
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+    return result_file
 
 
 def get_documents_from_db():
@@ -276,12 +441,15 @@ def save_to_history(user_id, file_name, file_text, similarities):
         "dbname=db_similarity user=postgres password=guitarflash215 host=localhost"
     )
     cur = conn.cursor()
+
+    # Simpan entry untuk setiap dokumen yang similar
     for doc_id, normalized_score, matched_text in similarities:
         cur.execute(
             "INSERT INTO history (user_id, document_id, uploaded_file_name, uploaded_file_text, similarity_score, matched_text) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
+            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
             (user_id, doc_id, file_name, file_text, normalized_score, matched_text)
         )
+
     conn.commit()
     cur.close()
     conn.close()
@@ -304,28 +472,119 @@ def check_similarity():
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(file_path)
 
+    # Ekstrak konten dari file
+    original_content = ""
     if filename.endswith('.txt'):
         with open(file_path, 'r') as f:
-            content = f.read()
+            original_content = f.read()
     elif filename.endswith('.docx'):
         doc = Document(file_path)
-        content = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+        original_content = "\n".join(
+            [paragraph.text for paragraph in doc.paragraphs])
     elif filename.endswith('.pdf'):
         with pdfplumber.open(file_path) as pdf:
-            content = "\n".join([page.extract_text()
-                                for page in pdf.pages if page.extract_text()])
+            original_content = "\n".join([page.extract_text()
+                                          for page in pdf.pages if page.extract_text()])
 
     db_docs = get_documents_from_db()
-    similarities = calculate_similarity(content, db_docs)
+    similarities = calculate_similarity(original_content, db_docs)
 
     user_id = session.get('user_id')
     if not user_id:
         return "User ID tidak ditemukan. Silakan login terlebih dahulu.", 400
 
-    save_to_history(user_id, filename, content, similarities)
+    # Simpan hasil ke history
+    save_to_history(user_id, filename, original_content, [
+                    (doc_id, score, "") for doc_id, score, tokens in similarities])
 
-    return render_template('similarity_results.html', similarities=similarities)
+    # Untuk setiap dokumen yang similar, buat PDF dengan highlight
+    result_files = []
+    for doc_id, score, similar_tokens in similarities:
+        # Ambil informasi dokumen dari database
+        db_doc = next((doc for doc in db_docs if doc['id'] == doc_id), None)
+        if db_doc:
+            # Buat PDF dengan highlight - tambahkan doc_id untuk menghasilkan nama file unik
+            result_file = save_result_pdf(
+                user_id, filename, original_content, similar_tokens, doc_id)
+            result_files.append((doc_id, score, result_file))
 
+    # Render template dengan hasil dan path ke file PDF
+    return render_template('similarity_results.html',
+                           similarities=[(doc_id, score, os.path.basename(file_path))
+                                         for doc_id, score, file_path in result_files])
+
+
+def get_file_path(history_id=None, user_id=None, doc_id=None):
+    """
+    Mengambil path file dari database berdasarkan history_id atau kombinasi user_id & doc_id.
+
+    Args:
+        history_id (int, optional): ID dari history di database.
+        user_id (int, optional): ID pengguna.
+        doc_id (int, optional): ID dokumen.
+
+    Returns:
+        str: Path ke file PDF atau None jika tidak ditemukan.
+    """
+    # Koneksi ke database
+    conn = psycopg2.connect(
+        "dbname=db_similarity user=postgres password=guitarflash215 host=localhost"
+    )
+    cur = conn.cursor()
+
+    if history_id:
+        # Cari berdasarkan history_id langsung
+        cur.execute(
+            "SELECT result_file_path FROM history WHERE id = %s", (history_id,))
+    elif user_id and doc_id:
+        # Cari file terbaru berdasarkan user_id & doc_id
+        cur.execute(
+            """
+            SELECT result_file_path 
+            FROM history 
+            WHERE user_id = %s AND document_id = %s AND result_file_path IS NOT NULL 
+            ORDER BY id DESC LIMIT 1
+            """,
+            (user_id, doc_id)
+        )
+    else:
+        # Jika tidak ada parameter yang valid
+        cur.close()
+        conn.close()
+        return None
+
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    return result[0] if result else None
+
+@app.route('/view/<int:history_id>')
+def view_result(history_id):
+    """
+    Menampilkan file PDF berdasarkan history_id tanpa opsi download.
+    """
+    conn = psycopg2.connect(
+        "dbname=db_similarity user=postgres password=guitarflash215 host=localhost"
+    )
+    cur = conn.cursor()
+
+    # Ambil path file hasil dari history
+    cur.execute("SELECT result_file_path FROM history WHERE id = %s", (history_id,))
+    result = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    if result and result[0]:
+        file_path = result[0]
+
+        # Cek apakah file ada
+        if os.path.exists(file_path):
+            return send_file(file_path, mimetype='application/pdf', as_attachment=False)
+    
+    # Jika file tidak ditemukan
+    abort(404, description="File tidak ditemukan.") 
 
 if __name__ == '__main__':
     init_db()
